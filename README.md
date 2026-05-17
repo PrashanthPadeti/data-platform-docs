@@ -30,34 +30,81 @@ Every project team must read and follow these standards before writing any code.
 
 ---
 
-## The One Rule
+## The Rule
 
-> **All projects share the Bronze Raw Zone. After the Raw Zone, every project is fully independent.**
+> **Raw Zone and Staging are shared. Every layer after Staging is fully independent per project.**
 >
 > A schema change, bug fix, or new feature in one project must never affect another project.
 
 ```
-Shared Bronze (Raw Zone)
-        │
-        ├──→  ASX Screener     (stg_au → mkt_au → fin_au → screener_au)
-        ├──→  India Screener   (stg_in → mkt_in → fin_in → screener_in)
-        ├──→  US Screener      (stg_us → mkt_us → fin_us → screener_us)
-        └──→  Charting         (stg_charts → charts_mkt → charts)
+┌─────────────────────────────────────────────┐
+│  SHARED (Platform-owned)                    │
+│                                             │
+│  Raw Zone  →  staging.*                     │
+│  (files)      (DB schema)                   │
+└──────────────────────┬──────────────────────┘
+                       │  each project reads independently
+         ┌─────────────┼─────────────┬──────────────────┐
+         ▼             ▼             ▼                  ▼
+  ┌────────────┐ ┌───────────┐ ┌──────────┐ ┌──────────────┐
+  │ ASX        │ │  INDIA    │ │    US    │ │  CHARTING    │
+  │ SCREENER   │ │ SCREENER  │ │ SCREENER │ │              │
+  │            │ │           │ │          │ │              │
+  │  mkt_au.*  │ │  mkt_in.* │ │ mkt_us.* │ │ charts_mkt.* │
+  │  fin_au.*  │ │  fin_in.* │ │ fin_us.* │ │              │
+  │ screener   │ │ screener  │ │ screener │ │  charts.*    │
+  │   _au.*    │ │   _in.*   │ │   _us.*  │ │              │
+  └────────────┘ └───────────┘ └──────────┘ └──────────────┘
+         │             │             │                  │
+         └─────────────┴─────────────┴──────────────────┘
+                                │
+                   ┌────────────▼────────────┐
+                   │  SHARED INFRASTRUCTURE  │
+                   │  users.*  notifications.│
+                   │  ai.*  subscriptions.*  │
+                   └─────────────────────────┘
 ```
 
 ---
 
 ## Quick Reference
 
-### Schema Map
+### What is Shared vs Independent
 
-| Project | Staging | Market | Financials | Application |
-|---|---|---|---|---|
-| ASX Screener | `stg_au.*` | `mkt_au.*` | `fin_au.*` | `screener_au.*` |
-| India Screener | `stg_in.*` | `mkt_in.*` | `fin_in.*` | `screener_in.*` |
-| US Screener | `stg_us.*` | `mkt_us.*` | `fin_us.*` | `screener_us.*` |
-| Charting | `stg_charts.*` | `charts_mkt.*` | — | `charts.*` |
-| Shared Infra | — | — | — | `users.*` `notifications.*` `ai.*` |
+| Layer | Shared or Independent | Schema | Owned by |
+|---|---|---|---|
+| Raw Zone (files) | ✅ Shared | `/opt/data-lake/raw/` | Platform team |
+| Staging (DB) | ✅ Shared | `staging.*` | Platform team |
+| Market Transform | 🔒 Independent | `mkt_au.*` / `mkt_in.*` / `mkt_us.*` | Each project |
+| Financials | 🔒 Independent | `fin_au.*` / `fin_in.*` / `fin_us.*` | Each project |
+| Application (Gold) | 🔒 Independent | `screener_au.*` / `screener_in.*` / `screener_us.*` | Each project |
+| Auth / Billing | ✅ Shared | `users.*` `notifications.*` `ai.*` | Platform team |
+
+### Shared Staging Schema Tables
+
+All exchanges land in the same `staging.*` schema. Projects filter by exchange:
+
+| Table | All exchanges stored | Projects read with |
+|---|---|---|
+| `staging.eod_prices` | AU, NSE, BSE, NYSE, NASDAQ | `WHERE exchange = 'AU'` |
+| `staging.fundamentals_raw` | All exchanges | `WHERE exchange = 'AU'` |
+| `staging.shares_stats` | All exchanges | `WHERE exchange IN ('AU')` |
+| `staging.dividends_raw` | All exchanges | `WHERE exchange = 'AU'` |
+| `staging.splits_raw` | All exchanges | `WHERE exchange = 'AU'` |
+| `staging.short_positions` | ASX (ASIC) only | ASX Screener only |
+| `staging.fii_dii_raw` | India (NSE) only | India Screener only |
+| `staging.promoter_holdings_raw` | India only | India Screener only |
+| `staging.sec_filings_raw` | US only | US Screener only |
+| `staging.insider_trades_raw` | US only | US Screener only |
+
+### Project Schema Map (Independent Layers Only)
+
+| Project | Market Transform | Financials | Application |
+|---|---|---|---|
+| ASX Screener | `mkt_au.*` | `fin_au.*` | `screener_au.*` |
+| India Screener | `mkt_in.*` | `fin_in.*` | `screener_in.*` |
+| US Screener | `mkt_us.*` | `fin_us.*` | `screener_us.*` |
+| Charting | `charts_mkt.*` | — | `charts.*` |
 
 ### Raw Zone Path
 
@@ -75,11 +122,11 @@ Shared Bronze (Raw Zone)
 
 ### Market Codes
 
-| Code | Exchange | Used in schemas, env vars, cache keys |
+| Code | Exchange | Used in independent schemas, env vars, cache keys |
 |---|---|---|
-| `au` | ASX | `stg_au`, `mkt_au`, `au:screener:*` |
-| `in` | NSE + BSE | `stg_in`, `mkt_in`, `in:screener:*` |
-| `us` | NYSE + NASDAQ | `stg_us`, `mkt_us`, `us:screener:*` |
+| `au` | ASX | `mkt_au`, `fin_au`, `screener_au`, `au:screener:*` |
+| `in` | NSE + BSE | `mkt_in`, `fin_in`, `screener_in`, `in:screener:*` |
+| `us` | NYSE + NASDAQ | `mkt_us`, `fin_us`, `screener_us`, `us:screener:*` |
 
 ---
 

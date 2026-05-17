@@ -299,18 +299,24 @@ def run(label: str, cmd: list[str]) -> None:
 ### Step ordering
 
 ```
-Step 1   Download Bronze files (read-only — may be skipped if already downloaded)
-Step 2   Load staging (stg_{market}.*)
-Step 3   Transform (mkt_{market}.daily_prices)
-Step 4   Daily compute (mkt_{market}.computed_metrics)
-Step 4b  Technical compute (mkt_{market}.daily_metrics)
-Step 4c  Half-yearly or quarterly compute (market-dependent)
-Step 4d  Period metrics
-Step 5   Build screener.universe (screener_{market}.universe)
+── PLATFORM PIPELINE (runs first — NOT your project) ──────────────────────────
+Step 1   [PLATFORM] Download raw files            → /opt/data-lake/raw/
+Step 2   [PLATFORM] Load staging                  → staging.*  (all exchanges)
+
+── YOUR PROJECT PIPELINE (runs after staging is loaded for your market) ────────
+Step 3   Transform daily prices                   → mkt_{market}.daily_prices
+Step 4   Daily compute engine                     → mkt_{market}.computed_metrics
+Step 4b  Technical compute engine                 → mkt_{market}.daily_metrics
+Step 4c  Half-yearly or quarterly compute         → mkt_{market}.halfyearly/quarterly_metrics
+Step 4d  Period metrics                           → mkt_{market}.period_metrics
+Step 5   Build Golden Record                      → screener_{market}.universe
 ```
 
-Steps 1-4 are fast (<2 min each). Step 5 (build screener.universe) takes 3-8 minutes
+Steps 3-4d are fast (<2 min each). Step 5 (build Golden Record) takes 3-8 minutes
 depending on universe size — that is expected.
+
+**Your project pipeline never includes Steps 1-2.** Raw zone and staging are
+platform-owned. Your pipeline reads from `staging.*` starting at Step 3.
 
 ---
 

@@ -23,7 +23,18 @@ Future markets follow the same pattern (e.g. `uk` for LSE, `jp` for TSE).
 
 ## Database Schema Naming
 
-### Pattern
+### Shared vs Independent
+
+| Layer | Schema | Owned by | Who writes | Who reads |
+|---|---|---|---|---|
+| Raw Zone (files) | `/opt/data-lake/raw/` | Platform | Platform pipeline | Platform pipeline |
+| Staging | `staging.*` | Platform | Platform pipeline | All projects (filtered by exchange) |
+| Market Transform | `mkt_au.*` / `mkt_in.*` / `mkt_us.*` | Each project | Each project | Same project only |
+| Financials | `fin_au.*` / `fin_in.*` / `fin_us.*` | Each project | Each project | Same project only |
+| Application (Gold) | `screener_au.*` / `screener_in.*` / `screener_us.*` | Each project | Each project | Same project + API |
+| Shared Infra | `users.*` `notifications.*` `ai.*` | Platform | Auth service | All projects (read-only) |
+
+### Pattern for Independent Schemas
 
 ```
 {market}_{layer}
@@ -31,31 +42,28 @@ Future markets follow the same pattern (e.g. `uk` for LSE, `jp` for TSE).
 
 ### All Schemas
 
-| Schema | Layer | Project |
-|---|---|---|
-| `stg_au` | Staging | ASX Screener |
-| `mkt_au` | Market transform | ASX Screener |
-| `fin_au` | Financials | ASX Screener |
-| `screener_au` | Application (Gold) | ASX Screener |
-| `stg_in` | Staging | India Nifty Screener |
-| `mkt_in` | Market transform | India Nifty Screener |
-| `fin_in` | Financials | India Nifty Screener |
-| `screener_in` | Application (Gold) | India Nifty Screener |
-| `stg_us` | Staging | US Screener |
-| `mkt_us` | Market transform | US Screener |
-| `fin_us` | Financials | US Screener |
-| `screener_us` | Application (Gold) | US Screener |
-| `stg_charts` | Staging | Charting (multi-market) |
-| `charts_mkt` | Market transform | Charting |
-| `charts` | Application (Gold) | Charting |
-| `users` | Auth / billing | Shared infrastructure |
-| `notifications` | Alerts / emails | Shared infrastructure |
-| `ai` | AI features | Shared infrastructure |
-| `raw` | Bronze DB landing | Platform (optional) |
+| Schema | Shared or Independent | Layer | Owned by |
+|---|---|---|---|
+| `staging` | ✅ **Shared** | Staging (all markets) | Platform |
+| `mkt_au` | 🔒 Independent | Market transform | ASX Screener |
+| `fin_au` | 🔒 Independent | Financials | ASX Screener |
+| `screener_au` | 🔒 Independent | Application (Gold) | ASX Screener |
+| `mkt_in` | 🔒 Independent | Market transform | India Screener |
+| `fin_in` | 🔒 Independent | Financials | India Screener |
+| `screener_in` | 🔒 Independent | Application (Gold) | India Screener |
+| `mkt_us` | 🔒 Independent | Market transform | US Screener |
+| `fin_us` | 🔒 Independent | Financials | US Screener |
+| `screener_us` | 🔒 Independent | Application (Gold) | US Screener |
+| `charts_mkt` | 🔒 Independent | Market transform | Charting |
+| `charts` | 🔒 Independent | Application (Gold) | Charting |
+| `users` | ✅ **Shared** | Auth / billing | Platform |
+| `notifications` | ✅ **Shared** | Alerts / emails | Platform |
+| `ai` | ✅ **Shared** | AI features | Platform |
 
 ### Rules
 
 - Schema names are **lowercase**, **underscored**, no hyphens.
+- `staging` has **no market prefix** — it is intentionally shared across all projects.
 - Never use a generic name like `market` or `data` without a market prefix.
 - Never use `public` schema for application tables.
 - Shared infrastructure schemas (`users`, `notifications`, `ai`) have **no market prefix** — they are intentionally cross-project.
