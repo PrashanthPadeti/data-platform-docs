@@ -3,62 +3,90 @@
 ## Architecture Principle
 
 ```
-Shared Raw Zone + Shared Staging  →  Project-Specific Transform  →  Project-Specific Gold
+Shared Raw Zone  →  Shared Staging (per-market)  →  Independent Project Pipelines  →  Project-Specific Gold
 ```
 
 All projects share **two layers**:
 1. **Raw Zone** — the file-based data lake (`/opt/data-lake/raw/`)
-2. **Staging** — the shared DB schema (`staging.*`) where raw files land as relational tables
+2. **Staging** — per-market DB schemas (`staging_au.*`, `staging_in.*`, `staging_us.*`) owned by the platform
 
-After the Staging layer, every project is **fully independent** — its own transform layer,
+After the Staging layer, every project is **fully independent** — its own pipeline, transform layer,
 compute engines, financials schema, and application tables.
 
-**Key guarantee**: A schema change, bug fix, or new feature in one project
-cannot break, affect, or be read by any other project.
+**Key guarantees**:
+- A schema change, bug fix, or new feature in one project cannot break, affect, or be read by any other project.
+- Common code is allowed only up to the Raw Zone and Staging layer. After Staging, no shared business logic or application code exists across projects.
+- A failure in one project pipeline never stops or impacts any other project pipeline.
 
 ---
 
 ## Architecture Diagram
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│  LAYER 1 — RAW ZONE  (Shared — Platform-owned)                                   │
-│  /opt/data-lake/raw/   —   immutable files, append-only                          │
-│                                                                                  │
-│  eodhd/exchange=AU/  eodhd/exchange=NSE/  eodhd/exchange=NYSE/                  │
-│  eodhd/exchange=BSE/ eodhd/exchange=NASDAQ/ asic/ nse-india/ sec/ finra/        │
-└─────────────────────────────────┬────────────────────────────────────────────────┘
-                                  │  platform pipeline loads all exchanges
-                                  ▼
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│  LAYER 2 — STAGING  (Shared — Platform-owned)                                    │
-│  staging.*   —   all exchanges, all providers in one schema                      │
-│                                                                                  │
-│  staging.eod_prices          staging.fundamentals_raw    staging.shares_stats   │
-│  staging.dividends_raw       staging.splits_raw          staging.short_positions │
-│  staging.fii_dii_raw         staging.promoter_holdings_raw                       │
-│  staging.sec_filings_raw     staging.insider_trades_raw                          │
-└─────────────────────────────────┬────────────────────────────────────────────────┘
-                                  │  each project reads independently (filtered by exchange)
-              ┌───────────────────┼────────────────────┬──────────────────┐
-              ▼                   ▼                    ▼                  ▼
-   ┌─────────────────┐  ┌──────────────────┐  ┌────────────────┐  ┌────────────────┐
-   │  ASX SCREENER   │  │  INDIA NIFTY     │  │  US SCREENER   │  │  CHARTING      │
-   │   Project A     │  │  SCREENER        │  │   Project C    │  │   Project D    │
-   │  ─────────────  │  │   Project B      │  │  ────────────  │  │  ────────────  │
-   │  mkt_au.*       │  │  ─────────────── │  │  mkt_us.*      │  │  charts_mkt.*  │
-   │  fin_au.*       │  │  mkt_in.*        │  │  fin_us.*      │  │                │
-   │  screener_au.*  │  │  fin_in.*        │  │  screener_us.* │  │  charts.*      │
-   └─────────────────┘  │  screener_in.*   │  └────────────────┘  └────────────────┘
-                        └──────────────────┘
-              │                   │                    │                  │
-              └───────────────────┴────────────────────┴──────────────────┘
-                                          │
-                             ┌────────────▼────────────┐
-                             │  SHARED INFRASTRUCTURE  │
-                             │  users.*  notifications.│
-                             │  ai.*  subscriptions.*  │
-                             └─────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 1 — RAW ZONE  (Shared — Platform-owned)                                      │
+│  /opt/data-lake/raw/   —   immutable files, append-only                             │
+│                                                                                     │
+│  eodhd/AU/   eodhd/NSE+BSE/   eodhd/NYSE+NASDAQ/   asic/   nse-india/   sec/       │
+│  finra/      charts/indices/   charts/forex/        charts/commodities/  charts/crypto/ │
+└──────────────┬──────────────────┬────────────────────┬──────────────────────────────┘
+               │  AU load job     │  India load job    │  US load job
+               ▼                  ▼                    ▼
+┌──────────────────┐  ┌───────────────────┐  ┌────────────────────┐
+│  staging_au.*    │  │  staging_in.*     │  │  staging_us.*      │
+│  Platform-owned  │  │  Platform-owned   │  │  Platform-owned    │
+│                  │  │                   │  │                    │
+│  eod_prices      │  │  eod_prices       │  │  eod_prices        │
+│  fundamentals    │  │  fundamentals     │  │  fundamentals      │
+│  shares_stats    │  │  shares_stats     │  │  shares_stats      │
+│  dividends_raw   │  │  dividends_raw    │  │  dividends_raw     │
+│  splits_raw      │  │  splits_raw       │  │  splits_raw        │
+│  short_positions │  │  fii_dii_raw      │  │  sec_filings_raw   │
+│                  │  │  promoter_        │  │  insider_trades_   │
+│                  │  │  holdings_raw     │  │  raw               │
+└───────┬──────────┘  └────────┬──────────┘  └──────────┬─────────┘
+        │                      │                         │
+        ▼                      ▼                         ▼
+┌───────────────┐   ┌──────────────────┐   ┌────────────────────┐
+│ ASX SCREENER  │   │ INDIA SCREENER   │   │  US SCREENER       │
+│  Project A    │   │   Project B      │   │   Project C        │
+│ ────────────  │   │ ──────────────── │   │  ────────────────  │
+│  mkt_au.*     │   │  mkt_in.*        │   │  mkt_us.*          │
+│  fin_au.*     │   │  fin_in.*        │   │  fin_us.*          │
+│  screener_au.*│   │  screener_in.*   │   │  screener_us.*     │
+└───────────────┘   └──────────────────┘   └────────────────────┘
+        │                      │                         │
+        └──────────────────────┴─────────────────────────┘
+                               │  views into all three staging schemas
+                               ▼
+                    ┌──────────────────────────────────────┐
+                    │  staging_charts.*  (Charting-owned)  │
+                    │                                      │
+                    │  VIEWS (no duplication):             │
+                    │  au_eod_prices → staging_au.*        │
+                    │  in_eod_prices → staging_in.*        │
+                    │  us_eod_prices → staging_us.*        │
+                    │  (only tables Charting needs)        │
+                    │                                      │
+                    │  OWN TABLES (Charting-specific):     │
+                    │  indices, forex, commodities, crypto │
+                    │  (loaded by Charting load job from   │
+                    │   /opt/data-lake/raw/charts/)        │
+                    └──────────────────┬───────────────────┘
+                                       ▼
+                              ┌─────────────────┐
+                              │  CHARTING       │
+                              │   Project D     │
+                              │  ────────────   │
+                              │  charts_mkt.*   │
+                              │  charts.*       │
+                              └─────────────────┘
+                                       │
+                          ┌────────────▼────────────┐
+                          │  SHARED INFRASTRUCTURE  │
+                          │  users.*  notifications.│
+                          │  ai.*  subscriptions.*  │
+                          └─────────────────────────┘
 ```
 
 ---
@@ -73,36 +101,84 @@ cannot break, affect, or be read by any other project.
 - **Owned by**: `datalake_ingest` service account
 - **Format**: Provider's original format (JSON, JSON.GZ, CSV)
 - **Mutation policy**: Append-only. Files are never modified or deleted after write.
-- **Who writes**: Only the shared download pipeline (`/opt/data-lake/jobs/`)
-- **Who reads**: The shared staging load pipeline
+- **Who writes**: Platform download pipeline + Charting download job (for indices/forex/commodities/crypto)
+- **Who reads**: The staging load pipelines
 
 See [02_bronze_layer_guide.md](02_bronze_layer_guide.md) for the full file layout.
 
-### Layer 2 — Staging (Shared)
+### Layer 2 — Staging (Per-market, Platform-owned)
 
-**Purpose**: Load raw files into relational tables. One schema for all exchanges.
+**Purpose**: Load raw files into relational tables. One schema per market for clear separation.
 
-- **Schema**: `staging.*`
-- **Owned by**: `datalake_ingest` service account (platform pipeline writes, project accounts read)
-- **Content**: Raw provider data in relational form — no computed columns, no business logic
-- **Filtering**: All exchanges coexist in the same tables; projects filter by `exchange` column
-- **Who writes**: Platform staging load pipeline
-- **Who reads**: Each project's transform pipeline, filtered to its own exchange(s)
+Each staging schema is loaded by an independent load job. Projects read only from their own market's staging schema.
 
-**Staging tables**:
+#### `staging_au.*` — ASX (Australia)
 
-| Table | Content | Exchange filter |
+- **Owned by**: Platform (`datalake_ingest`)
+- **Loaded by**: Platform AU load job
+- **Read by**: ASX Screener
+
+| Table | Content |
+|---|---|
+| `staging_au.eod_prices` | OHLCV prices — ASX equities |
+| `staging_au.fundamentals_raw` | Balance sheet, P&L, cashflow |
+| `staging_au.shares_stats` | Shares outstanding, ownership |
+| `staging_au.dividends_raw` | Dividend history |
+| `staging_au.splits_raw` | Stock split history |
+| `staging_au.short_positions` | ASIC short data (ASX-specific) |
+
+#### `staging_in.*` — India (NSE + BSE)
+
+- **Owned by**: Platform (`datalake_ingest`)
+- **Loaded by**: Platform India load job
+- **Read by**: India Screener
+
+| Table | Content |
+|---|---|
+| `staging_in.eod_prices` | OHLCV prices — NSE + BSE equities |
+| `staging_in.fundamentals_raw` | Balance sheet, P&L, cashflow |
+| `staging_in.shares_stats` | Shares outstanding, ownership |
+| `staging_in.dividends_raw` | Dividend history |
+| `staging_in.splits_raw` | Stock split history |
+| `staging_in.fii_dii_raw` | FII/DII institutional flows |
+| `staging_in.promoter_holdings_raw` | Promoter SEBI disclosure |
+
+#### `staging_us.*` — US (NYSE + NASDAQ + AMEX)
+
+- **Owned by**: Platform (`datalake_ingest`)
+- **Loaded by**: Platform US load job
+- **Read by**: US Screener
+
+| Table | Content |
+|---|---|
+| `staging_us.eod_prices` | OHLCV prices — NYSE + NASDAQ + AMEX |
+| `staging_us.fundamentals_raw` | Balance sheet, P&L, cashflow |
+| `staging_us.shares_stats` | Shares outstanding, ownership |
+| `staging_us.dividends_raw` | Dividend history |
+| `staging_us.splits_raw` | Stock split history |
+| `staging_us.sec_filings_raw` | 10-K / 10-Q SEC filings |
+| `staging_us.insider_trades_raw` | SEC Form 4 insider trades |
+
+#### `staging_charts.*` — Charting (Multi-market)
+
+- **Owned by**: Charting project (`charts_app`)
+- **Loaded by**: Charting load job (for own tables) + views into platform staging
+- **Read by**: Charting project only
+
+| Object | Type | Content |
 |---|---|---|
-| `staging.eod_prices` | OHLCV prices — all exchanges | `WHERE exchange = 'AU'` / `'NSE'` / `'NYSE'` etc. |
-| `staging.fundamentals_raw` | Balance sheet, P&L, cashflow | `WHERE exchange = 'AU'` etc. |
-| `staging.shares_stats` | Shares outstanding, ownership | `WHERE exchange = 'AU'` etc. |
-| `staging.dividends_raw` | Dividend history | `WHERE exchange = 'AU'` etc. |
-| `staging.splits_raw` | Stock split history | `WHERE exchange = 'AU'` etc. |
-| `staging.short_positions` | ASIC short data | ASX Screener only |
-| `staging.fii_dii_raw` | India FII/DII flows | India Screener only |
-| `staging.promoter_holdings_raw` | India promoter SEBI disclosure | India Screener only |
-| `staging.sec_filings_raw` | US 10-K/10-Q filings | US Screener only |
-| `staging.insider_trades_raw` | US SEC Form 4 | US Screener only |
+| `staging_charts.au_eod_prices` | VIEW → `staging_au.eod_prices` | ASX prices (no duplication) |
+| `staging_charts.in_eod_prices` | VIEW → `staging_in.eod_prices` | India prices (no duplication) |
+| `staging_charts.us_eod_prices` | VIEW → `staging_us.eod_prices` | US prices (no duplication) |
+| `staging_charts.au_splits` | VIEW → `staging_au.splits_raw` | ASX splits (no duplication) |
+| `staging_charts.in_splits` | VIEW → `staging_in.splits_raw` | India splits (no duplication) |
+| `staging_charts.us_splits` | VIEW → `staging_us.splits_raw` | US splits (no duplication) |
+| `staging_charts.indices` | TABLE (own data) | Global indices — S&P 500, FTSE, Nikkei, DAX, etc. |
+| `staging_charts.forex` | TABLE (own data) | Forex pairs — AUD/USD, USD/INR, EUR/USD, etc. |
+| `staging_charts.commodities` | TABLE (own data) | Gold, Oil, Iron Ore, etc. |
+| `staging_charts.crypto` | TABLE (own data) | BTC, ETH, etc. |
+
+Views are created by the Charting project. Only the specific tables Charting needs are exposed as views — not the full staging schema.
 
 ### Layer 3 — Market Transform (Independent per project)
 
@@ -116,6 +192,7 @@ No project reads from another project's transform schema.
 **Purpose**: Normalised financial statements in the accounting standard of the market.
 
 Each project has its own financials schema — `fin_au.*`, `fin_in.*`, `fin_us.*`.
+Charting does not have a financials schema (not required for charting).
 
 ### Layer 5 — Application / Gold (Independent per project)
 
@@ -135,8 +212,8 @@ Each project has its own financials schema — `fin_au.*`, `fin_in.*`, `fin_us.*
 ### Project A: ASX Screener
 
 **Market**: Australian Securities Exchange (ASX)
-**Reads from staging**: `WHERE exchange = 'AU'`
-**Additional staging sources**: `staging.short_positions` (ASIC)
+**Reads from staging**: `staging_au.*`
+**Additional staging sources**: `staging_au.short_positions` (ASIC)
 
 **Unique features**:
 - Franking credits → grossed-up dividend yield
@@ -159,8 +236,8 @@ screener_au.*     Application layer — Golden Record
 ### Project B: India Nifty Screener
 
 **Market**: National Stock Exchange (NSE) and Bombay Stock Exchange (BSE)
-**Reads from staging**: `WHERE exchange IN ('NSE', 'BSE')`
-**Additional staging sources**: `staging.fii_dii_raw`, `staging.promoter_holdings_raw`
+**Reads from staging**: `staging_in.*`
+**Additional staging sources**: `staging_in.fii_dii_raw`, `staging_in.promoter_holdings_raw`
 
 **Unique features**:
 - Promoter holdings % (mandatory SEBI disclosure) — key risk signal
@@ -171,7 +248,6 @@ screener_au.*     Application layer — Golden Record
 - Quarterly reporting mandatory (standalone + consolidated results)
 - Circuit breakers: upper/lower circuit % — stock-specific daily price limits
 - BSE/NSE dual-listing deduplication (same company, two exchange codes)
-- No franking credits — dividend yield is pre-tax gross yield
 
 **Independent schemas**:
 ```
@@ -182,22 +258,13 @@ screener_in.*     Application layer — Golden Record
 
 **Golden Record**: `screener_in.universe` — one row per stock, rebuilt nightly.
 
-**India-only transform tables** (within `mkt_in.*`):
-```
-mkt_in.fii_dii_flows        FII/DII institutional buy/sell flows (daily)
-mkt_in.promoter_holdings    SEBI-mandated promoter holding disclosures
-mkt_in.pledged_shares       Promoter pledge data
-mkt_in.circuit_limits       Per-stock upper/lower circuit bands
-fin_in.quarterly_results    Quarterly P&L (standalone + consolidated)
-```
-
 ---
 
 ### Project C: US Screener
 
 **Market**: NYSE, NASDAQ, AMEX
-**Reads from staging**: `WHERE exchange IN ('NYSE', 'NASDAQ', 'AMEX')`
-**Additional staging sources**: `staging.sec_filings_raw`, `staging.insider_trades_raw`
+**Reads from staging**: `staging_us.*`
+**Additional staging sources**: `staging_us.sec_filings_raw`, `staging_us.insider_trades_raw`
 
 **Unique features**:
 - Quarterly reporting (10-Q mandatory via SEC)
@@ -207,7 +274,6 @@ fin_in.quarterly_results    Quarterly P&L (standalone + consolidated)
 - SEC 13F institutional ownership (quarterly, ≥$100M AUM threshold)
 - FINRA bi-monthly short interest data (short float %, days-to-cover)
 - GAAP vs non-GAAP EPS reconciliation
-- No franking credits — straightforward dividend yield
 
 **Independent schemas**:
 ```
@@ -218,39 +284,36 @@ screener_us.*     Application layer — Golden Record
 
 **Golden Record**: `screener_us.universe` — one row per stock, rebuilt nightly.
 
-**US-only transform tables** (within `mkt_us.*`):
-```
-mkt_us.short_interest        FINRA bi-monthly short reports
-mkt_us.insider_trades        SEC Form 4 insider buy/sell
-mkt_us.institutional_13f     SEC 13F quarterly institutional holdings
-fin_us.quarterly_results     10-Q data
-```
-
 ---
 
 ### Project D: Charting (Multi-Market)
 
-**Markets**: All (AU, IN, US — and any future market)
-**Reads from staging**: All exchanges — `staging.eod_prices`, `staging.splits_raw`, `staging.dividends_raw`
+**Markets**: All — ASX, India, US + Global Indices, Forex, Commodities, Crypto
+**Reads from**: `staging_charts.*` (views into `staging_au.*`, `staging_in.*`, `staging_us.*` + own tables)
 
 **Design principle**: Market-agnostic. All instruments use a unified namespace:
-`{MARKET}:{CODE}` — e.g. `AU:BHP`, `IN:RELIANCE`, `US:AAPL`
+`{MARKET}:{CODE}` — e.g. `AU:BHP`, `IN:RELIANCE`, `US:AAPL`, `FX:AUDUSD`, `CRYPTO:BTC`
 
 **Key differences from Screener projects**:
 - Uses **split-adjusted** prices (for continuous chart lines across corporate actions)
 - Screener projects use **unadjusted** prices (for accurate valuation ratios)
 - Needs multi-timeframe pre-aggregated bars (1m, 5m, 15m, 1h, 4h, 1d, 1w, 1M)
 - Needs corporate event annotations (dividends, splits, earnings dates) on chart timeline
+- Also handles non-equity instruments: indices, forex, commodities, crypto
+
+**Own staging load job**: Charting downloads and loads its own Indices/Forex/Commodities/Crypto
+data from `/opt/data-lake/raw/charts/` into `staging_charts.*` own tables.
 
 **Independent schemas**:
 ```
+staging_charts.*  Charting staging (views + own tables) — Charting-owned
 charts_mkt.*      Chart-optimised transform layer
 charts.*          Application layer
 ```
 
 **Key tables**:
 ```
-charts_mkt.ohlcv             Unified split-adjusted OHLCV, all markets
+charts_mkt.ohlcv             Unified split-adjusted OHLCV, all markets + indices/forex/crypto
 charts_mkt.corporate_events  Dividends + splits merged for chart annotations
 charts_mkt.indicator_cache   Pre-computed indicator series
 charts_mkt.multi_tf_bars     Pre-aggregated multi-timeframe bars
@@ -281,49 +344,69 @@ subscriptions.*     Stripe billing, plan management
 ## Database Role Isolation
 
 ```
-Role                 READ access                              WRITE access
-──────────────────────────────────────────────────────────────────────────────────
-datalake_ingest      (none — file system only)               staging.*
-screener_au_app      staging.* (exchange=AU only via app)    mkt_au.*, fin_au.*
-                     mkt_au.*, fin_au.*, users.*              screener_au.*
-screener_in_app      staging.* (exchange=NSE/BSE via app)    mkt_in.*, fin_in.*
-                     mkt_in.*, fin_in.*, users.*              screener_in.*
-screener_us_app      staging.* (exchange=NYSE/NASDAQ via app) mkt_us.*, fin_us.*
-                     mkt_us.*, fin_us.*, users.*              screener_us.*
-charts_app           staging.* (all exchanges via app)       charts_mkt.*, charts.*
-                     charts_mkt.*, users.*
-readonly             screener_au.universe,                   (none)
-                     screener_in.universe,
-                     screener_us.universe
+Role                  READ access                              WRITE access
+──────────────────────────────────────────────────────────────────────────────────────
+datalake_ingest       (none — file system only)               staging_au.*
+                                                               staging_in.*
+                                                               staging_us.*
+
+screener_au_app       staging_au.*, users.*                   mkt_au.*, fin_au.*
+                      mkt_au.*, fin_au.*                      screener_au.*
+
+screener_in_app       staging_in.*, users.*                   mkt_in.*, fin_in.*
+                      mkt_in.*, fin_in.*                      screener_in.*
+
+screener_us_app       staging_us.*, users.*                   mkt_us.*, fin_us.*
+                      mkt_us.*, fin_us.*                      screener_us.*
+
+charts_app            staging_au.*, staging_in.*,             staging_charts.*
+                      staging_us.*, users.*                   charts_mkt.*, charts.*
+                      charts_mkt.*
+
+readonly              screener_au.universe,                   (none)
+                      screener_in.universe,
+                      screener_us.universe
 ```
 
 No project role has SELECT on another project's transform or application schemas.
-All project roles read `staging.*` but filter in application code to their own exchange.
 
 ---
 
 ## Pipeline Schedule
 
 ```
-Time (UTC)       Job                              Owner
-──────────────────────────────────────────────────────────────────
-18:00 Mon-Fri    download_eodhd_au.py             Platform (data-lake)
-18:00 Mon-Fri    download_asic_shorts.py          Platform (data-lake)
-18:30 Mon-Fri    load_staging_au.py               Platform (data-lake)
-──── India ───────────────────────────────────────────────────────
-10:00 Mon-Fri    download_eodhd_nse_bse.py        Platform (data-lake)
-10:30 Mon-Fri    download_nse_india_feeds.py      Platform (data-lake)
-11:00 Mon-Fri    load_staging_in.py               Platform (data-lake)
-──── US ──────────────────────────────────────────────────────────
-21:30 Mon-Fri    download_eodhd_us.py             Platform (data-lake)
-22:00 Mon-Fri    download_sec_form4.py            Platform (data-lake)
-22:30 Mon-Fri    load_staging_us.py               Platform (data-lake)
-──── Project pipelines (start AFTER staging is loaded) ───────────
-19:00 Mon-Fri    asx_daily_pipeline.py            ASX Screener project
-11:30 Mon-Fri    india_daily_pipeline.py          India Screener project
-23:00 Mon-Fri    us_daily_pipeline.py             US Screener project
-19:30 Mon-Fri    charting_daily_pipeline.py       Charting project
+Time (UTC)       Job                                Owner
+──────────────────────────────────────────────────────────────────────
+── AU ────────────────────────────────────────────────────────────────
+18:00 Mon-Fri    download_eodhd_au.py               Platform (data-lake)
+18:00 Mon-Fri    download_asic_shorts.py            Platform (data-lake)
+18:30 Mon-Fri    load_staging_au.py                 Platform (data-lake)
+
+── India ─────────────────────────────────────────────────────────────
+10:00 Mon-Fri    download_eodhd_nse_bse.py          Platform (data-lake)
+10:30 Mon-Fri    download_nse_india_feeds.py        Platform (data-lake)
+11:00 Mon-Fri    load_staging_in.py                 Platform (data-lake)
+
+── US ────────────────────────────────────────────────────────────────
+21:30 Mon-Fri    download_eodhd_us.py               Platform (data-lake)
+22:00 Mon-Fri    download_sec_form4.py              Platform (data-lake)
+22:30 Mon-Fri    load_staging_us.py                 Platform (data-lake)
+
+── Charting (own staging load) ───────────────────────────────────────
+22:30 Mon-Fri    download_charts_data.py            Charting project
+23:00 Mon-Fri    load_staging_charts.py             Charting project
+
+── Project pipelines (start AFTER staging is loaded) ─────────────────
+19:00 Mon-Fri    asx_daily_pipeline.py              ASX Screener project
+11:30 Mon-Fri    india_daily_pipeline.py            India Screener project
+23:00 Mon-Fri    us_daily_pipeline.py               US Screener project
+23:30 Mon-Fri    charting_daily_pipeline.py         Charting project
 ```
 
-**Project pipelines start from the transform step** — they do NOT download files
-or load staging. They read from `staging.*` and write to their own schemas.
+**Project pipelines start from the transform step** — they do NOT download platform files
+or load platform staging. They read from their staging schema and write to their own schemas.
+
+**Charting pipeline** starts after all platform staging loads AND its own staging load are complete.
+
+**Failure isolation**: Each pipeline runs as an independent cron job. A failure in one project
+does not stop or affect any other project's pipeline.

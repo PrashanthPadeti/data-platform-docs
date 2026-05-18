@@ -27,24 +27,34 @@ Future markets follow the same pattern (e.g. `uk` for LSE, `jp` for TSE).
 
 | Layer | Schema | Owned by | Who writes | Who reads |
 |---|---|---|---|---|
-| Raw Zone (files) | `/opt/data-lake/raw/` | Platform | Platform pipeline | Platform pipeline |
-| Staging | `staging.*` | Platform | Platform pipeline | All projects (filtered by exchange) |
+| Raw Zone (files) | `/opt/data-lake/raw/` | Platform | Platform pipeline + Charting | Platform pipeline + Charting |
+| AU Staging | `staging_au.*` | Platform | Platform AU load job | ASX Screener |
+| India Staging | `staging_in.*` | Platform | Platform India load job | India Screener |
+| US Staging | `staging_us.*` | Platform | Platform US load job | US Screener |
+| Charts Staging | `staging_charts.*` | Charting project | Charting load job | Charting project only |
 | Market Transform | `mkt_au.*` / `mkt_in.*` / `mkt_us.*` | Each project | Each project | Same project only |
 | Financials | `fin_au.*` / `fin_in.*` / `fin_us.*` | Each project | Each project | Same project only |
 | Application (Gold) | `screener_au.*` / `screener_in.*` / `screener_us.*` | Each project | Each project | Same project + API |
+| Charts Transform | `charts_mkt.*` | Charting | Charting project | Charting project + API |
+| Charts Application | `charts.*` | Charting | Charting project | Charting project + API |
 | Shared Infra | `users.*` `notifications.*` `ai.*` | Platform | Auth service | All projects (read-only) |
 
 ### Pattern for Independent Schemas
 
 ```
-{market}_{layer}
+{market}_{layer}      ← screener projects
+charts_{layer}        ← charting project
+staging_{market}      ← platform staging schemas
 ```
 
 ### All Schemas
 
 | Schema | Shared or Independent | Layer | Owned by |
 |---|---|---|---|
-| `staging` | ✅ **Shared** | Staging (all markets) | Platform |
+| `staging_au` | ✅ **Shared** | Staging — ASX | Platform |
+| `staging_in` | ✅ **Shared** | Staging — India | Platform |
+| `staging_us` | ✅ **Shared** | Staging — US | Platform |
+| `staging_charts` | 🔒 Independent | Staging — Charting-specific | Charting project |
 | `mkt_au` | 🔒 Independent | Market transform | ASX Screener |
 | `fin_au` | 🔒 Independent | Financials | ASX Screener |
 | `screener_au` | 🔒 Independent | Application (Gold) | ASX Screener |
@@ -63,8 +73,9 @@ Future markets follow the same pattern (e.g. `uk` for LSE, `jp` for TSE).
 ### Rules
 
 - Schema names are **lowercase**, **underscored**, no hyphens.
-- `staging` has **no market prefix** — it is intentionally shared across all projects.
-- Never use a generic name like `market` or `data` without a market prefix.
+- Staging schemas use the `staging_{market}` pattern — one schema per market, owned by the platform.
+- `staging_charts` is the exception — owned by the Charting project, contains views + own tables.
+- Never use a generic name like `staging` without a market suffix.
 - Never use `public` schema for application tables.
 - Shared infrastructure schemas (`users`, `notifications`, `ai`) have **no market prefix** — they are intentionally cross-project.
 
@@ -82,24 +93,56 @@ Tables do NOT repeat the schema name. The schema provides the namespace.
 
 ```sql
 -- Correct
+staging_au.eod_prices
 mkt_au.daily_prices
 screener_in.universe
 fin_us.annual_pnl
 
 -- Wrong — redundant prefix
-mkt_au.au_daily_prices      ← "au_" is redundant, schema already says au
+staging_au.au_eod_prices    ← "au_" is redundant, schema already says au
+mkt_au.au_daily_prices      ← "au_" is redundant
 screener_in.india_universe  ← "india_" is redundant
 ```
 
-### Standard Table Names (same name, different schema per project)
-
-These tables exist in all screener projects with the same structure:
+### Standard Staging Table Names (same name across all staging schemas)
 
 | Table | Description |
 |---|---|
-| `{stg}.eod_prices` | Staging: raw EOD prices from provider |
-| `{stg}.fundamentals_raw` | Staging: raw financial statements |
-| `{stg}.shares_stats` | Staging: shares outstanding + ownership |
+| `{stg}.eod_prices` | Raw EOD prices from provider |
+| `{stg}.fundamentals_raw` | Raw financial statements |
+| `{stg}.shares_stats` | Shares outstanding + ownership |
+| `{stg}.dividends_raw` | Dividend history |
+| `{stg}.splits_raw` | Stock split history |
+
+### Market-Unique Staging Tables
+
+| Table | Schema | Unique to |
+|---|---|---|
+| `short_positions` | `staging_au` | ASX Screener (ASIC data) |
+| `fii_dii_raw` | `staging_in` | India Screener |
+| `promoter_holdings_raw` | `staging_in` | India Screener |
+| `sec_filings_raw` | `staging_us` | US Screener (SEC EDGAR) |
+| `insider_trades_raw` | `staging_us` | US Screener (SEC Form 4) |
+
+### Charting Staging Objects (`staging_charts.*`)
+
+| Object | Type | Description |
+|---|---|---|
+| `au_eod_prices` | VIEW → `staging_au.eod_prices` | ASX prices — no data duplication |
+| `in_eod_prices` | VIEW → `staging_in.eod_prices` | India prices — no data duplication |
+| `us_eod_prices` | VIEW → `staging_us.eod_prices` | US prices — no data duplication |
+| `au_splits` | VIEW → `staging_au.splits_raw` | ASX splits — no data duplication |
+| `in_splits` | VIEW → `staging_in.splits_raw` | India splits — no data duplication |
+| `us_splits` | VIEW → `staging_us.splits_raw` | US splits — no data duplication |
+| `indices` | TABLE | Global indices — S&P 500, FTSE, Nikkei, DAX, etc. |
+| `forex` | TABLE | Forex pairs — AUD/USD, USD/INR, EUR/USD, etc. |
+| `commodities` | TABLE | Gold, Oil, Iron Ore, etc. |
+| `crypto` | TABLE | BTC, ETH, etc. |
+
+### Standard Transform/Application Table Names (same name, different schema per project)
+
+| Table | Description |
+|---|---|
 | `{mkt}.companies_current` | SCD2 master company list |
 | `{mkt}.daily_prices` | TimescaleDB OHLCV (unadjusted) |
 | `{mkt}.daily_metrics` | Computed technical indicators |
@@ -115,7 +158,7 @@ These tables exist in all screener projects with the same structure:
 | `{fin}.annual_cashflow` | Cash flow statement |
 | `{screener}.universe` | Golden Record — one row per stock |
 
-### Market-Unique Tables (only exist for one project)
+### Market-Unique Transform Tables (only exist for one project)
 
 | Table | Schema | Unique to |
 |---|---|---|
@@ -211,6 +254,10 @@ eod_prices_AU_2026-05-16_083002.json.gz
 fundamentals_NSE_2026-05-01_130000.json.gz
 short_positions_AU_2026-05-14_090000.csv
 form4_insider_NYSE_2026-05-16_233500.json.gz
+indices_GLOBAL_2026-05-16_230000.json.gz
+forex_2026-05-16_230000.json.gz
+commodities_2026-05-16_230000.json.gz
+crypto_2026-05-16_230000.json.gz
 ```
 
 ### Script Files
@@ -219,7 +266,10 @@ form4_insider_NYSE_2026-05-16_233500.json.gz
 {action}_{target}.py
 
 download_eod_prices.py
-load_to_staging_prices.py
+load_staging_au.py
+load_staging_in.py
+load_staging_us.py
+load_staging_charts.py
 transform_daily_prices.py
 compute_daily_metrics.py
 build_screener_universe.py
@@ -247,6 +297,7 @@ charting_pipeline.log
 DATABASE_URL_SYNC_AU=postgresql://...
 DATABASE_URL_SYNC_IN=postgresql://...
 DATABASE_URL_SYNC_US=postgresql://...
+DATABASE_URL_SYNC_CHARTS=postgresql://...
 
 # Provider API keys (shared, not market-specific)
 EODHD_API_KEY=...
@@ -261,12 +312,13 @@ REDIS_URL=redis://localhost:6379/0
 REDIS_URL_AU=redis://localhost:6379/1
 REDIS_URL_IN=redis://localhost:6379/2
 REDIS_URL_US=redis://localhost:6379/3
+REDIS_URL_CHARTS=redis://localhost:6379/4
 ```
 
 ### Redis Cache Key Namespaces
 
 ```
-asx:screener:*          ASX Screener cache
+au:screener:*           ASX Screener cache
 in:screener:*           India Screener cache
 us:screener:*           US Screener cache
 charts:*                Charting cache
@@ -293,21 +345,30 @@ Redis databases (0-15) are allocated per project to prevent key collisions:
 
 ## Instrument Namespace (Charting Project)
 
-The Charting project handles instruments from multiple markets. It uses a unified
-instrument key to avoid collisions (e.g. `BHP` exists on both ASX and NYSE):
+The Charting project handles instruments from multiple markets and asset classes.
+It uses a unified instrument key to avoid collisions:
 
 ```
-{MARKET_CODE_UPPER}:{EXCHANGE_CODE}
+{ASSET_CLASS}:{CODE}
 
-AU:BHP          BHP Group — ASX
-US:BHP          BHP Group ADR — NYSE
-IN:RELIANCE     Reliance Industries — NSE
-US:AAPL         Apple Inc — NASDAQ
-IN:TCS          Tata Consultancy — NSE
-AU:CBA          Commonwealth Bank — ASX
+AU:BHP          BHP Group — ASX equity
+US:BHP          BHP Group ADR — NYSE equity
+IN:RELIANCE     Reliance Industries — NSE equity
+US:AAPL         Apple Inc — NASDAQ equity
+IN:TCS          Tata Consultancy — NSE equity
+AU:CBA          Commonwealth Bank — ASX equity
+IDX:SPX         S&P 500 Index
+IDX:FTSE        FTSE 100 Index
+IDX:N225        Nikkei 225 Index
+FX:AUDUSD       AUD/USD Forex pair
+FX:USDINR       USD/INR Forex pair
+CMD:GOLD        Gold (spot)
+CMD:OIL         Crude Oil (WTI)
+CRYPTO:BTC      Bitcoin
+CRYPTO:ETH      Ethereum
 ```
 
-Screener projects do NOT need this prefix (they are single-market).
+Screener projects do NOT need this prefix (they are single-market, equities only).
 
 ---
 
@@ -316,8 +377,18 @@ Screener projects do NOT need this prefix (they are single-market).
 Each project lives in its own repository. The data lake lives in a separate repository.
 
 ```
+data-platform-docs/             ← this repo — architecture source of truth
+  README.md
+  docs/
+
 data-lake/                      ← shared, platform-owned
   jobs/
+    download_eodhd_au.py
+    download_eodhd_nse_bse.py
+    download_eodhd_us.py
+    load_staging_au.py
+    load_staging_in.py
+    load_staging_us.py
   docs/
 
 asx-screener/                   ← Project A
@@ -327,21 +398,23 @@ asx-screener/                   ← Project A
   compute/
   jobs/
   database/migrations/
-  docs/architecture/            ← this document lives here (source of truth)
+  docs/platform/ → link to data-platform-docs
 
 nifty-screener/                 ← Project B (future)
-  backend/
   ...
-  docs/architecture/ → symlink or copy from asx-screener/docs/architecture/
+  docs/platform/ → link to data-platform-docs
 
 us-screener/                    ← Project C (future)
   ...
 
 charting/                       ← Project D (future)
+  jobs/
+    download_charts_data.py     ← Charting-owned download job
+    load_staging_charts.py      ← Charting-owned staging load
+    charting_pipeline.py        ← Charting transform + build pipeline
   ...
 ```
 
-The `docs/architecture/` directory in `asx-screener` is the **source of truth**.
-Other projects should copy (or symlink) these docs at project creation and keep
-them in sync when the platform architecture evolves. Architecture changes must
-be communicated to all project teams.
+The `data-platform-docs` repository is the **source of truth** for all architecture decisions.
+All projects should link to or copy these docs at project creation and keep them in sync.
+Architecture changes must be communicated to all project teams.

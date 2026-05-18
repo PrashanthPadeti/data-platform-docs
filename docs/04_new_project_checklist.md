@@ -4,7 +4,7 @@ Use this checklist when bootstrapping a new screener project (e.g. India Nifty,
 US Screener) or any other project on this data platform.
 
 Completing this checklist correctly ensures the new project is:
-- Reading from the shared Staging layer (not downloading raw data itself)
+- Reading from the correct per-market Staging schema (not downloading raw data itself)
 - Fully isolated from all existing projects after the Staging layer
 - Using the correct schema naming convention
 - Schedulable without interfering with existing pipelines
@@ -18,13 +18,19 @@ Before writing any code, be clear on what the platform provides and what your pr
 | Layer | Who owns it | Your project does |
 |---|---|---|
 | Raw Zone (files) | Platform team | Nothing — read-only |
-| Staging `staging.*` | Platform team | Read from it (filtered by exchange) |
+| Staging `staging_au.*` | Platform team | Read from it (ASX Screener only) |
+| Staging `staging_in.*` | Platform team | Read from it (India Screener only) |
+| Staging `staging_us.*` | Platform team | Read from it (US Screener only) |
+| Staging `staging_charts.*` | **Charting project** | Create views + load own tables (Charting only) |
 | Market Transform `mkt_{market}.*` | **Your project** | Create tables, write, maintain |
 | Financials `fin_{market}.*` | **Your project** | Create tables, write, maintain |
 | Application `screener_{market}.*` | **Your project** | Create tables, write, maintain |
 
 Your project pipeline **starts at the transform step** — it does NOT download files
-or load staging. The platform pipeline handles that.
+or load the platform staging schemas. The platform pipeline handles that.
+
+**Code separation rule**: No shared business logic or application code is allowed
+across projects. Your project's code is fully independent after the staging layer.
 
 ---
 
@@ -32,9 +38,9 @@ or load staging. The platform pipeline handles that.
 
 - [ ] Read [01_platform_overview.md](01_platform_overview.md) — understand the full architecture
 - [ ] Read [03_naming_conventions.md](03_naming_conventions.md) — confirm your market code and schema names
-- [ ] Confirm which exchanges you need (e.g. `NSE`, `BSE`, `NYSE`, `NASDAQ`)
-- [ ] Confirm the platform pipeline is already loading `staging.*` for your exchange — check with the platform team
-- [ ] Confirm `staging.eod_prices` has data for your exchange: `SELECT MAX(date) FROM staging.eod_prices WHERE exchange = '{YOUR_EXCHANGE}';`
+- [ ] Confirm which staging schema your project reads from (`staging_au`, `staging_in`, or `staging_us`)
+- [ ] Confirm the platform pipeline is already loading your market's staging schema — check with the platform team
+- [ ] Verify staging data exists: `SELECT MAX(date) FROM staging_{market}.eod_prices;`
 
 ---
 
@@ -44,7 +50,7 @@ or load staging. The platform pipeline handles that.
 
 ```sql
 -- Replace {market} with your market code: in, us, etc.
--- Do NOT create stg_{market} — staging is shared and already exists
+-- Do NOT create staging_{market} — that is platform-owned and already exists
 CREATE SCHEMA IF NOT EXISTS mkt_{market};
 CREATE SCHEMA IF NOT EXISTS fin_{market};
 CREATE SCHEMA IF NOT EXISTS screener_{market};
@@ -56,32 +62,36 @@ CREATE SCHEMA IF NOT EXISTS screener_{market};
 -- Create role (replace {market})
 CREATE ROLE screener_{market}_app LOGIN PASSWORD 'your_strong_password';
 
--- Grant READ access to shared staging (project filters by exchange in app code)
-GRANT USAGE  ON SCHEMA staging                    TO screener_{market}_app;
-GRANT SELECT ON ALL TABLES IN SCHEMA staging      TO screener_{market}_app;
+-- Grant READ access to your market's staging schema
+GRANT USAGE  ON SCHEMA staging_{market}               TO screener_{market}_app;
+GRANT SELECT ON ALL TABLES IN SCHEMA staging_{market} TO screener_{market}_app;
 
 -- Grant FULL access to own independent schemas
-GRANT USAGE, CREATE ON SCHEMA mkt_{market}        TO screener_{market}_app;
-GRANT USAGE, CREATE ON SCHEMA fin_{market}        TO screener_{market}_app;
-GRANT USAGE, CREATE ON SCHEMA screener_{market}   TO screener_{market}_app;
+GRANT USAGE, CREATE ON SCHEMA mkt_{market}            TO screener_{market}_app;
+GRANT USAGE, CREATE ON SCHEMA fin_{market}            TO screener_{market}_app;
+GRANT USAGE, CREATE ON SCHEMA screener_{market}       TO screener_{market}_app;
 
 -- Grant READ access to shared infrastructure (auth only)
-GRANT USAGE  ON SCHEMA users                      TO screener_{market}_app;
-GRANT SELECT ON ALL TABLES IN SCHEMA users        TO screener_{market}_app;
+GRANT USAGE  ON SCHEMA users                          TO screener_{market}_app;
+GRANT SELECT ON ALL TABLES IN SCHEMA users            TO screener_{market}_app;
 
--- IMPORTANT: Do NOT grant access to other projects' independent schemas
+-- IMPORTANT: Do NOT grant access to other projects' staging or independent schemas
+-- No access to staging_au (if you're not ASX), staging_in, staging_us (cross-market)
 -- No access to mkt_au, fin_au, screener_au (or any other project's schemas)
 ```
 
 ### 1.3 Verify isolation
 
 ```sql
--- Your role CAN read staging (shared)
+-- Your role CAN read your market's staging
 SET ROLE screener_{market}_app;
-SELECT COUNT(*) FROM staging.eod_prices WHERE exchange = 'NSE';  -- should work
+SELECT COUNT(*) FROM staging_{market}.eod_prices;  -- should work
+
+-- Your role CANNOT read another project's staging
+SELECT * FROM staging_au.eod_prices LIMIT 1;       -- should return permission denied (if not AU project)
 
 -- Your role CANNOT read another project's transform data
-SELECT * FROM mkt_au.daily_prices LIMIT 1;  -- should return permission denied
+SELECT * FROM mkt_au.daily_prices LIMIT 1;         -- should return permission denied
 RESET ROLE;
 ```
 
@@ -99,7 +109,7 @@ Create numbered migration files in `database/migrations/`:
 005_screener_{market}_universe.sql    -- Golden Record table
 ```
 
-Note: No staging migration — `staging.*` is owned by the platform, already exists.
+Note: No staging migration — `staging_{market}.*` is owned by the platform, already exists.
 
 Run migrations in order:
 
@@ -126,12 +136,12 @@ done
 │   └── migrations/
 ├── compute/
 │   └── engine/
-│       ├── daily_compute.py        ← reads staging.*, writes mkt_{market}.computed_metrics
-│       └── yearly_compute.py       ← reads staging.*, writes mkt_{market}.yearly_metrics
+│       ├── daily_compute.py        ← reads mkt_{market}.*, writes mkt_{market}.computed_metrics
+│       └── yearly_compute.py       ← reads fin_{market}.*, writes mkt_{market}.yearly_metrics
 ├── scripts/
 │   └── {provider}/
 │       └── v1/
-│           ├── transform_daily_prices.py   ← reads staging.eod_prices, writes mkt_{market}.*
+│           ├── transform_daily_prices.py   ← reads staging_{market}.eod_prices, writes mkt_{market}.*
 │           └── build_screener_universe.py  ← reads mkt/fin, writes screener_{market}.universe
 ├── jobs/
 │   └── daily_pipeline.py           ← orchestrates transform + compute + build steps only
@@ -154,55 +164,55 @@ Add to your project's `.env`:
 # Database (your project-specific role — NOT the platform role)
 DATABASE_URL_SYNC=postgresql://screener_{market}_app:password@localhost:5432/asx_screener
 
-# Market identifier (used in logging, cache keys, exchange filter)
+# Market identifier (used in logging, cache keys)
 MARKET_CODE={market}          # in, us, etc.
-EXCHANGE_CODES=NSE,BSE        # comma-separated list of exchange codes in staging
 
 # Redis (use project-specific DB number to avoid key collisions)
 REDIS_URL=redis://localhost:6379/{db_number}
 # AU=1, IN=2, US=3, Charts=4
 ```
 
-Note: No `DATA_LAKE_PATH` or `EODHD_API_KEY` needed — your project does not touch raw files.
+Note: No `DATA_LAKE_PATH`, `EODHD_API_KEY`, or `EXCHANGE_CODES` needed —
+your project does not touch raw files and reads from a market-specific staging schema
+that already contains only your market's data.
 
 ---
 
 ## Step 5 — Transform Layer
 
-Your transform script reads from `staging.*` (filtering by exchange) and writes
-to `mkt_{market}.*`.
+Your transform script reads from `staging_{market}.*` and writes to `mkt_{market}.*`.
+
+No `WHERE exchange = ?` filter needed — the staging schema already contains only your market's data.
 
 Key pattern:
 
 ```python
-EXCHANGE_CODES = os.getenv("EXCHANGE_CODES", "NSE,BSE").split(",")
-
-# Read from SHARED staging — always filter by exchange
+# Read from YOUR MARKET'S staging schema — no exchange filter needed
 cur.execute("""
     SELECT asx_code, date, open, high, low, close, volume
-    FROM staging.eod_prices
-    WHERE exchange = ANY(%s) AND date = %s
-""", (EXCHANGE_CODES, target_date))
+    FROM staging_{market}.eod_prices
+    WHERE date = %s
+""", (target_date,))
 
 rows = cur.fetchall()
 
 # Write into YOUR OWN transform schema
 cur.executemany("""
-    INSERT INTO mkt_{market}.daily_prices (nse_code, time, open, high, low, close, volume)
+    INSERT INTO mkt_{market}.daily_prices (ticker, time, open, high, low, close, volume)
     VALUES (%s, %s, %s, %s, %s, %s, %s)
-    ON CONFLICT (nse_code, time) DO UPDATE SET ...
+    ON CONFLICT (ticker, time) DO UPDATE SET ...
 """, rows)
 ```
 
-**Never write to `staging.*`** — it is owned by the platform.
+**Never write to `staging_{market}.*`** — it is owned by the platform.
 
 The ticker column name for each market:
 
-| Market | Ticker column name | Example value |
-|---|---|---|
-| AU | `asx_code` | `BHP` |
-| IN | `nse_code` | `RELIANCE` |
-| US | `ticker` | `AAPL` |
+| Market | Staging schema | Ticker column name | Example value |
+|---|---|---|---|
+| AU | `staging_au` | `asx_code` | `BHP` |
+| IN | `staging_in` | `nse_code` | `RELIANCE` |
+| US | `staging_us` | `ticker` | `AAPL` |
 
 ---
 
@@ -243,50 +253,7 @@ conn = psycopg2.connect(
 )
 ```
 
-Standard columns every screener universe must have:
-
-```sql
--- Identity
-ticker, company_name, sector, industry, stock_type, status,
-is_large, is_mid, is_small, is_micro, is_nano, market_cap_tier,
-
--- Price
-price, price_date, volume, avg_volume_20d, market_cap, high_52w, low_52w,
-
--- Valuation
-pe_ratio, forward_pe, price_to_book, price_to_sales, ev_to_ebitda,
-price_to_fcf, fcf_yield,
-
--- Dividends
-dividend_yield, dps_ttm, payout_ratio,
-
--- Profitability
-gross_margin, ebitda_margin, net_margin, operating_margin, roe, roa, roce,
-
--- Growth
-revenue_growth_1y, revenue_growth_3y_cagr, earnings_growth_1y,
-eps_cagr_5y, ebitda_growth_1y, fcf_growth_1y,
-
--- Balance Sheet
-debt_to_equity, current_ratio, net_debt_to_ebitda, interest_coverage,
-
--- Technicals
-rsi_14, macd, macd_signal, sma_50, sma_200, adx_14,
-above_sma50, above_sma200, golden_cross, death_cross,
-dma50_ratio, dma200_ratio, relative_volume,
-
--- Returns
-return_1w, return_1m, return_3m, return_6m, return_1y, return_ytd,
-drawdown_from_ath, volatility_20d, beta_1y,
-
--- Quality
-piotroski_f_score, altman_z_score,
-
--- Metadata
-universe_built_at
-```
-
-Add market-unique columns on top of this standard set.
+See [05_pipeline_standards.md](05_pipeline_standards.md) for the full standard column list.
 
 ---
 
@@ -314,49 +281,55 @@ Your `jobs/daily_pipeline.py` starts from **Step 3 (Transform)**. Steps 1 and 2
 (download + staging load) are handled by the platform pipeline — not your project.
 
 ```
-Step 1   [PLATFORM] Download raw files            → /opt/data-lake/raw/
-Step 2   [PLATFORM] Load staging                  → staging.*
-─────────────────────────────────────────────────────────────────────
-Step 3   [YOUR PROJECT] Transform daily prices    → mkt_{market}.daily_prices
-Step 4   [YOUR PROJECT] Daily compute engine      → mkt_{market}.computed_metrics
-Step 4b  [YOUR PROJECT] Technical compute         → mkt_{market}.daily_metrics
-Step 4c  [YOUR PROJECT] Yearly compute            → mkt_{market}.yearly_metrics
-Step 5   [YOUR PROJECT] Build Golden Record       → screener_{market}.universe
+Step 1   [PLATFORM] Download raw files              → /opt/data-lake/raw/
+Step 2   [PLATFORM] Load staging_{market}.*         → staging_{market}.*
+─────────────────────────────────────────────────────────────────────────
+Step 3   [YOUR PROJECT] Transform daily prices      → mkt_{market}.daily_prices
+Step 4   [YOUR PROJECT] Daily compute engine        → mkt_{market}.computed_metrics
+Step 4b  [YOUR PROJECT] Technical compute           → mkt_{market}.daily_metrics
+Step 4c  [YOUR PROJECT] Yearly compute              → mkt_{market}.yearly_metrics
+Step 5   [YOUR PROJECT] Build Golden Record         → screener_{market}.universe
 ```
+
+Your pipeline must run as an independent process. A failure in your pipeline
+must not stop or affect any other project's pipeline.
 
 ---
 
 ## Step 10 — Crontab Registration
 
-Add your pipeline to the **server crontab** — run AFTER the platform staging pipeline completes:
+Add your pipeline to the **server crontab** — run AFTER the platform staging pipeline completes
+for your market:
 
 ```bash
 crontab -e
 ```
 
 ```
-# {Market} Screener daily pipeline (starts after platform staging load completes)
+# {Market} Screener daily pipeline (starts after platform staging_{market} load completes)
 {minute} {hour} * * 1-5 cd /opt/{market}-screener && /opt/{market}-screener/venv/bin/python jobs/daily_pipeline.py >> /opt/{market}-screener/logs/daily_pipeline_{market}.log 2>&1
 ```
 
 Check platform pipeline schedule in [01_platform_overview.md](01_platform_overview.md)
-to ensure your pipeline runs after staging is loaded for your market.
+to ensure your pipeline runs after `staging_{market}.*` is fully loaded.
 
 ---
 
 ## Step 11 — Verification Checklist
 
-- [ ] `SELECT COUNT(*) FROM staging.eod_prices WHERE exchange = '{EXCHANGE}';` returns rows
+- [ ] `SELECT COUNT(*) FROM staging_{market}.eod_prices;` returns rows
 - [ ] `SELECT COUNT(*) FROM screener_{market}.universe;` returns expected number of stocks
 - [ ] `SELECT * FROM screener_{market}.universe LIMIT 5;` shows sensible data (no all-nulls rows)
 - [ ] API returns 200 on `POST /api/v1/{market}/screener` with empty filters
 - [ ] DB role isolation verified — role cannot read `mkt_au.*` or any other project's schemas
-- [ ] DB role CAN read `staging.*` (needed for transform step)
-- [ ] Crontab entry runs after platform staging pipeline (check timing in overview doc)
+- [ ] DB role CAN read `staging_{market}.*` (needed for transform step)
+- [ ] DB role CANNOT read other markets' staging schemas (e.g. `staging_au` if you're not ASX)
+- [ ] Crontab entry runs after platform staging pipeline for your market (check timing in overview doc)
 - [ ] Redis cache key prefix uses market code (not shared with other projects)
 - [ ] `.env` uses project-specific DB role
 - [ ] No download scripts or staging load scripts in your project — platform owns those
 - [ ] Build script uses TCP keepalives
+- [ ] No `EXCHANGE_CODES` env var — schema separation replaces exchange filtering
 
 ---
 
@@ -364,12 +337,15 @@ to ensure your pipeline runs after staging is loaded for your market.
 
 | Do not | Reason |
 |---|---|
-| Create `stg_{market}.*` schemas | Staging is shared — `staging.*` already exists |
-| Write to `staging.*` | Platform owns staging — your project only reads it |
+| Create `staging_{market}.*` schemas | Platform staging already exists — don't recreate it |
+| Write to `staging_{market}.*` | Platform owns staging — your project only reads it |
 | Download raw files in your pipeline | Raw zone and staging load belong to the platform |
+| Use `WHERE exchange = ?` filters on staging | Staging schemas are already per-market — no filter needed |
+| Read from another project's staging | e.g. India project must not read `staging_au.*` |
 | Read from `mkt_au.*` in the India project | Cross-project dependency — breaks isolation |
 | Use another project's DB role | Gives access to the wrong project's data |
 | Share a log file with another project | Makes debugging impossible |
 | Use `public` schema | No namespacing — collisions guaranteed |
 | Skip TCP keepalives on the build script | Long-running upsert will SSL-timeout |
 | Add download jobs to your project's crontab | Downloads belong to the platform pipeline |
+| Share business logic or application code with another project | Violates code separation rule |

@@ -13,6 +13,7 @@ idempotent, and consistent with other projects on the platform.
 3. **Observable** — every run produces structured logs with counts and timings
 4. **Isolated** — a pipeline never reads or writes to another project's schemas
 5. **Datestamped** — every job accepts `--date YYYY-MM-DD` to target a specific date
+6. **Failure-isolated** — a failure in one project pipeline never stops or affects another project pipeline
 
 ---
 
@@ -187,8 +188,8 @@ Run it again → same result. Safe to re-run on failure.
 ### Pattern 2 — DELETE + INSERT (for staging tables)
 
 ```sql
-DELETE FROM stg_au.eod_prices WHERE date = %(date)s;
-INSERT INTO stg_au.eod_prices (...) VALUES ...;
+DELETE FROM staging_au.eod_prices WHERE date = %(date)s;
+INSERT INTO staging_au.eod_prices (...) VALUES ...;
 ```
 
 Used when you want staging to reflect exactly what was in the Bronze file for a date.
@@ -236,6 +237,38 @@ conn.commit()
 **Commit strategy**:
 - Commit every `COMMIT_EVERY` stocks (default: 50) to avoid one giant transaction
 - Never commit inside the individual stock try/except — commit at the batch level
+
+---
+
+## Pipeline Failure Isolation
+
+Each project pipeline must run as a fully independent process. A failure in one
+project must never stop or affect any other project.
+
+### Rules
+
+1. Every project has its **own crontab entry** — never chain two projects in one crontab line
+2. Every project writes to its **own log file** — failures are visible per-project
+3. Project pipelines are triggered **independently** after their market's staging load completes
+4. A non-zero exit code in Project A's pipeline must not prevent Project B from running
+5. Never use `sys.exit()` in a shared script — only in the project's own orchestrator
+
+### Charting Pipeline Trigger
+
+The Charting pipeline depends on ALL platform staging loads being complete, plus its
+own staging load:
+
+```
+Wait for: staging_au (loaded ~18:30 UTC)
+          staging_in (loaded ~11:00 UTC)
+          staging_us (loaded ~22:30 UTC)
+          staging_charts own tables (loaded ~23:00 UTC)
+Start at: 23:30 UTC (after all of the above)
+```
+
+If one of the platform staging loads fails on a given night, the Charting pipeline
+should still run with whatever data is available — it should not hard-fail because
+one market is missing.
 
 ---
 
@@ -296,27 +329,39 @@ def run(label: str, cmd: list[str]) -> None:
     log.info(f"✓  {label} done")
 ```
 
-### Step ordering
+### Step Ordering
 
 ```
 ── PLATFORM PIPELINE (runs first — NOT your project) ──────────────────────────
-Step 1   [PLATFORM] Download raw files            → /opt/data-lake/raw/
-Step 2   [PLATFORM] Load staging                  → staging.*  (all exchanges)
+Step 1a  [PLATFORM] Download AU raw files           → /opt/data-lake/raw/eodhd/AU/
+Step 1b  [PLATFORM] Download India raw files        → /opt/data-lake/raw/eodhd/NSE+BSE/
+Step 1c  [PLATFORM] Download US raw files           → /opt/data-lake/raw/eodhd/NYSE+NASDAQ/
 
-── YOUR PROJECT PIPELINE (runs after staging is loaded for your market) ────────
-Step 3   Transform daily prices                   → mkt_{market}.daily_prices
-Step 4   Daily compute engine                     → mkt_{market}.computed_metrics
-Step 4b  Technical compute engine                 → mkt_{market}.daily_metrics
-Step 4c  Half-yearly or quarterly compute         → mkt_{market}.halfyearly/quarterly_metrics
-Step 4d  Period metrics                           → mkt_{market}.period_metrics
-Step 5   Build Golden Record                      → screener_{market}.universe
+Step 2a  [PLATFORM] Load staging_au.*               (independent AU load job)
+Step 2b  [PLATFORM] Load staging_in.*               (independent India load job)
+Step 2c  [PLATFORM] Load staging_us.*               (independent US load job)
+
+── CHARTING STAGING (Charting project — runs alongside platform) ───────────────
+Step 2d  [CHARTING] Download Indices/Forex/Commodities/Crypto
+Step 2e  [CHARTING] Load staging_charts.* own tables
+
+── YOUR PROJECT PIPELINE (runs after your market's staging is loaded) ──────────
+Step 3   Transform daily prices                     → mkt_{market}.daily_prices
+Step 4   Daily compute engine                       → mkt_{market}.computed_metrics
+Step 4b  Technical compute engine                   → mkt_{market}.daily_metrics
+Step 4c  Half-yearly or quarterly compute           → mkt_{market}.halfyearly/quarterly_metrics
+Step 4d  Period metrics                             → mkt_{market}.period_metrics
+Step 5   Build Golden Record                        → screener_{market}.universe
 ```
 
 Steps 3-4d are fast (<2 min each). Step 5 (build Golden Record) takes 3-8 minutes
 depending on universe size — that is expected.
 
-**Your project pipeline never includes Steps 1-2.** Raw zone and staging are
-platform-owned. Your pipeline reads from `staging.*` starting at Step 3.
+**Your project pipeline never includes Steps 1-2.** Staging schemas are
+platform-owned. Your pipeline reads from `staging_{market}.*` starting at Step 3.
+
+**No exchange filter needed** — `staging_{market}.*` already contains only your
+market's data. Do not add `WHERE exchange = ?` filters.
 
 ---
 
@@ -325,7 +370,7 @@ platform-owned. Your pipeline reads from `staging.*` starting at Step 3.
 ### Backfill missing prices for one date
 
 ```bash
-# Run Step 1 for a specific past date
+# Run Step 1 for a specific past date (platform pipeline)
 python scripts/{provider}/v1/download_eod_prices.py --date 2026-05-01 --force
 
 # Then run the full pipeline for that date
@@ -358,6 +403,7 @@ python scripts/{provider}/v1/build_screener_universe.py
 2. Every project writes to its **own log file** — `logs/daily_pipeline_{market}.log`
 3. Pipeline steps are **not individually cron'd** — only the orchestrator is
 4. Bronze download jobs are in the **data lake crontab**, not any project crontab
+5. Your project's crontab runs **after** the platform staging load for your market completes
 
 ### Crontab template (adjust time for market close)
 
@@ -384,7 +430,7 @@ grep -i "error\|failed\|exception" /opt/{market}-screener/logs/daily_pipeline_{m
 
 ## Adding a New Column to screener.universe
 
-Every new column requires changes in exactly 4 places. Missing any one causes bugs:
+Every new column requires changes in exactly these places. Missing any one causes bugs:
 
 1. **Database migration** — `ALTER TABLE screener_{market}.universe ADD COLUMN ...`
 2. **Build script INSERT list** — add column name to INSERT column list
